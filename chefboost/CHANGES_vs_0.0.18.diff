@@ -1,0 +1,933 @@
+diff -ruN a/Chefboost.py b/Chefboost.py
+--- a/Chefboost.py
++++ b/Chefboost.py
+@@ -25,6 +25,7 @@
+     target_label: str = "Decision",
+     validation_df: Optional[pd.DataFrame] = None,
+     silent: bool = False,
++    name: str = None,
+ ) -> Dict[str, Any]:
+     """
+     Build (a) decision tree model(s)
+@@ -265,13 +266,19 @@
+         )
+     else:  # regular decision tree building
+         root = 1
+-        file = "outputs/rules/rules.py"
++        file = "outputs/rules/{0}.py".format(name)
+         functions.createFile(file, header)
+ 
+         if enableParallelism == True:
+-            json_file = "outputs/rules/rules.json"
++            json_file = "outputs/rules/{0}.json".format(name)
+             functions.createFile(json_file, "[\n")
+ 
++        feature_value_map = config.get("feature_value_map", None)
++        default_return = config.get("default_return", None)
++        if config.get("leaf_label") == "prior":
++            config["_leaf_prior"] = df["Decision"].value_counts(normalize=True).to_dict()
++        #
++
+         trees = Training.buildDecisionTree(
+             df,
+             root=root,
+@@ -283,6 +290,9 @@
+             parents="root",
+             validation_df=validation_df,
+             main_process_id=process_id,
++            name=name,
++            feature_value_map=feature_value_map,
++            default_return = default_return
+         )
+ 
+     if silent is False:
+@@ -291,6 +301,8 @@
+ 
+     obj = {"trees": trees, "alphas": alphas, "config": config, "nan_values": nan_values}
+ 
++    functions.rulebuffer.flush_all()
++
+     # -----------------------------------------
+ 
+     # train set accuracy
+@@ -349,7 +361,8 @@
+ 
+         column_index = column_index + 1
+ 
+-    logger.debug(f"instance: {param}")
++    if logger.is_debug():
++        logger.debug(f"instance: {param}")
+     # -----------------------
+ 
+     enableGBM = config["enableGBM"]
+@@ -438,7 +451,7 @@
+ 
+     model["trees"] = module_names
+ 
+-    with open(f"outputs/rules/{file_name}", "wb") as f:
++    with open(file_name, "wb") as f:
+         pickle.dump(model, f)
+ 
+ 
+@@ -510,6 +523,8 @@
+         if silent is False:
+             logger.info(f"Decision rule: {rule}")
+ 
++        functions.rulebuffer.flush(rule)
++
+         with open(rule, "r", encoding="UTF-8") as file:
+             lines = file.readlines()
+ 
+diff -ruN a/commons/evaluate.py b/commons/evaluate.py
+--- a/commons/evaluate.py
++++ b/commons/evaluate.py
+@@ -32,6 +32,8 @@
+         logger.info("-------------------------")
+ 
+     if problem_type == "classification":
++        df["Decision"] = df["Decision"].astype(str)
++        df["Prediction"] = df["Prediction"].astype(str)
+         idx = df[df["Prediction"] == df["Decision"]].index
+         accuracy = 100 * len(idx) / df.shape[0]
+         if silent is False:
+@@ -44,6 +46,9 @@
+         predictions = df.Prediction.values
+         actuals = df.Decision.values
+ 
++        evaluation_results["Actuals"] = actuals
++        evaluation_results["Predictions"] = predictions
++
+         # -----------------------------
+         # confusion matrix
+ 
+diff -ruN a/commons/functions.py b/commons/functions.py
+--- a/commons/functions.py
++++ b/commons/functions.py
+@@ -10,6 +10,7 @@
+ from chefboost import Chefboost as cb
+ from chefboost.commons.logger import Logger
+ from chefboost.commons.module import load_module
++from chefboost.commons import rulebuffer
+ 
+ # pylint: disable=no-else-return, broad-except
+ 
+@@ -25,10 +26,11 @@
+     Returns:
+         None
+     """
++    values = df.to_numpy(copy=True)
++
+     predictions = []
+-    for _, instance in df.iterrows():
+-        features = instance.values[0:-1]
+-        prediction = cb.predict(model, features)
++    for row in values:
++        prediction = cb.predict(model, row[0:-1])
+         predictions.append(prediction)
+ 
+     df["Prediction"] = predictions
+@@ -96,9 +98,9 @@
+     Returns:
+         None
+     """
+-    with open(file, "a+", encoding="UTF-8") as f:
+-        f.writelines(content)
+-        f.writelines("\n")
++    if not isinstance(content, str):
++        content = "".join(content)
++    rulebuffer.append(file, content + "\n")
+ 
+ 
+ def createFile(file: str, content: str) -> None:
+@@ -110,6 +112,7 @@
+     Returns
+         None
+     """
++    rulebuffer.reset(file)
+     with open(file, "w", encoding="UTF-8") as f:
+         f.write(content)
+ 
+@@ -134,16 +137,7 @@
+             for file in os.listdir(outputs_path + "data"):
+                 os.remove(outputs_path + "data" + os.path.sep + file)
+ 
+-        if path.exists(outputs_path + "rules"):
+-            for file in os.listdir(outputs_path + "rules"):
+-                if (
+-                    ".py" in file
+-                    or ".json" in file
+-                    or ".txt" in file
+-                    or ".pkl" in file
+-                    or ".csv" in file
+-                ):
+-                    os.remove(outputs_path + "rules" + os.path.sep + file)
++        pass
+     except Exception as err:
+         logger.warn(str(err))
+ 
+@@ -171,7 +165,7 @@
+     max_depth = 5
+     enableAdaboost = False
+     num_of_weak_classifier = 4
+-    enableParallelism = False
++    enableParallelism = True
+     num_cores = int(multiprocessing.cpu_count() / 2)  # allocate half of your total cores
+     # num_cores = int((3*multiprocessing.cpu_count())/4) #allocate 3/4 of your total cores
+     # num_cores = multiprocessing.cpu_count()
+diff -ruN a/commons/logger.py b/commons/logger.py
+--- a/commons/logger.py
++++ b/commons/logger.py
+@@ -16,6 +16,10 @@
+             )
+             self.log_level = logging.INFO
+ 
++    def is_debug(self) -> bool:
++        """True when debug logging is on (lets callers skip building expensive log strings)."""
++        return self.log_level <= logging.DEBUG
++
+     def info(self, message):
+         if self.log_level <= logging.INFO:
+             self.dump_log(f"{message}")
+diff -ruN a/commons/module.py b/commons/module.py
+--- a/commons/module.py
++++ b/commons/module.py
+@@ -6,24 +6,38 @@
+ 
+ def load_module(module_name: str) -> ModuleType:
+     """
+-    Load python module with its name
+-    Args:
+-        module_name (str): module name without .py extension
+-    Returns:
+-        module (ModuleType)
++    Load python module with its name.
++
++    Rule modules (e.g. the GA's shared ``model_test``) are rewritten on every
++    fit, often several times within the same second. Both ``imp.load_module``
++    and importlib's default loader may then serve a *stale* cached bytecode
++    (.pyc mtime resolution is 1s), returning a previous fit's tree and causing
++    str/float type mismatches at predict time. To be robust we resolve the
++    source path, then read and ``exec`` the current source directly — no
++    bytecode cache is consulted or written.
+     """
+-    if sys.version_info >= (3, 11):
++    import os
++
++    # chefboost passes a path-style name like "outputs/rules/model_test"
++    # (see Training.buildDecisionTree / restoreTree docstring). Resolve it to the
++    # .py file directly; fall back to importlib for dotted module names.
++    source_path = module_name + ".py"
++    if not os.path.exists(source_path):
+         import importlib.util
+ 
+         spec = importlib.util.find_spec(module_name)
+-        if spec is None:
++        if spec is None or spec.origin is None:
+             raise ImportError(f"Module '{module_name}' not found")
++        source_path = spec.origin
++
++    from chefboost.commons import rulebuffer
++
++    rulebuffer.flush(source_path)
+ 
+-        module = importlib.util.module_from_spec(spec)
+-        spec.loader.exec_module(module)
+-        return module
+-    else:
+-        import imp  # pylint: disable=deprecated-module
++    with open(source_path, "r", encoding="UTF-8") as f:
++        source = f.read()
+ 
+-        fp, pathname, description = imp.find_module(module_name)
+-        return imp.load_module(module_name, fp, pathname, description)
++    module = ModuleType(os.path.basename(module_name))
++    module.__file__ = source_path
++    exec(compile(source, source_path, "exec"), module.__dict__)  # pylint: disable=exec-used
++    return module
+diff -ruN a/commons/rulebuffer.py b/commons/rulebuffer.py
+--- a/commons/rulebuffer.py
++++ b/commons/rulebuffer.py
+@@ -0,0 +1,37 @@
++"""In-memory buffer for rule-file lines.
++
++functions.storeRule used to open the rule file once per line; lines are now collected here
++and written in one go by flush() before the file is read.
++"""
++
++import os
++
++_DISABLED = os.environ.get("CHEFBOOST_NO_RULEBUFFER") == "1"
++
++_BUFFER = {}
++
++
++def reset(path: str) -> None:
++    """Discard the unwritten buffer of a file (called when the file is re-created)."""
++    _BUFFER.pop(path, None)
++
++
++def append(path: str, content: str) -> None:
++    if _DISABLED:
++        with open(path, "a+", encoding="UTF-8") as f:
++            f.write(content)
++        return
++    _BUFFER.setdefault(path, []).append(content)
++
++
++def flush(path: str) -> None:
++    """Append the buffered lines to the file and clear the buffer."""
++    lines = _BUFFER.pop(path, None)
++    if lines:
++        with open(path, "a+", encoding="UTF-8") as f:
++            f.write("".join(lines))
++
++
++def flush_all() -> None:
++    for path in list(_BUFFER):
++        flush(path)
+diff -ruN a/training/Preprocess.py b/training/Preprocess.py
+--- a/training/Preprocess.py
++++ b/training/Preprocess.py
+@@ -7,6 +7,68 @@
+ logger = Logger(module="chefboost/training/Preprocess.py")
+ 
+ 
++def _entropy_from_counts(counts, instances: int) -> float:
++    """Entropy from a vector of class counts (same result as Training.calculateEntropy)."""
++    if instances == 0:
++        return 0
++    entropy = 0
++    for idx in np.argsort(-counts, kind="stable"):
++        c = int(counts[idx])
++        if c == 0:
++            break
++        class_probability = c / instances
++        entropy = entropy - class_probability * math.log(class_probability, 2)
++    return entropy
++
++
++def _fast_continuous_metrics(df, column_name, entropy, config, unique_values):
++    """Gain / gain ratio of every threshold of a continuous attribute via cumulative class counts (ID3/C4.5)."""
++    algorithm = config["algorithm"]
++    vals = df[column_name].to_numpy()
++    if vals.dtype.kind not in "iuf" or np.isnan(vals).any():
++        return None
++
++    dec_codes, dec_uniques = pd.factorize(df["Decision"], sort=False)
++    if len(dec_uniques) == 0 or (dec_codes < 0).any():
++        return None
++    n_class = len(dec_uniques)
++    n = len(vals)
++
++    order = np.argsort(vals, kind="stable")
++    vals_sorted = vals[order]
++    dec_sorted = dec_codes[order]
++
++    cum = np.zeros((n_class, n + 1), dtype=np.int64)
++    for c in range(n_class):
++        cum[c, 1:] = np.cumsum(dec_sorted == c)
++    total_counts = cum[:, n]
++
++    subset_gains = []
++    subset_gainratios = []
++    for i in range(0, len(unique_values) - 1):
++        threshold = unique_values[i]
++        k = int(np.searchsorted(vals_sorted, threshold, side="right"))
++
++        subset1_rows = k
++        subset2_rows = n - k
++        subset1_probability = subset1_rows / n
++        subset2_probability = subset2_rows / n
++
++        e1 = _entropy_from_counts(cum[:, k], subset1_rows)
++        e2 = _entropy_from_counts(total_counts - cum[:, k], subset2_rows)
++
++        threshold_gain = entropy - subset1_probability * e1 - subset2_probability * e2
++        subset_gains.append(threshold_gain)
++
++        if algorithm == "C4.5":
++            threshold_splitinfo = -subset1_probability * math.log(
++                subset1_probability, 2
++            ) - subset2_probability * math.log(subset2_probability, 2)
++            subset_gainratios.append(threshold_gain / threshold_splitinfo)
++
++    return subset_gains, subset_gainratios
++
++
+ def processContinuousFeatures(
+     algorithm: str, df: pd.DataFrame, column_name: str, entropy: float, config: dict
+ ) -> pd.DataFrame:
+@@ -60,7 +122,17 @@
+         )
+         return df
+ 
++    _fast = None
++    if algorithm in ["ID3", "C4.5"]:
++        _fast = _fast_continuous_metrics(df, column_name, entropy, config, unique_values)
++
++    if _fast is not None:
++        subset_gains, subset_gainratios = _fast
++
+     for i in range(0, len(unique_values) - 1):
++        if _fast is not None:
++            break
++
+         threshold = unique_values[i]
+ 
+         subset1 = df[df[column_name] <= threshold]
+@@ -163,7 +235,10 @@
+         # ----------------------------------
+ 
+     if algorithm == "C4.5":
+-        winner_one = subset_gainratios.index(max(subset_gainratios))
++        try:
++            winner_one = subset_gainratios.index(max(subset_gainratios))
++        except Exception as e:
++            print('ad')
+     elif (
+         algorithm == "ID3"
+     ):  # actually, ID3 does not support for continuous features but we can still do it
+diff -ruN a/training/Training.py b/training/Training.py
+--- a/training/Training.py
++++ b/training/Training.py
+@@ -1,5 +1,7 @@
+ # built-in imports
+ import math
++import itertools
++import os
+ import uuid
+ import json
+ import copy
+@@ -23,6 +25,13 @@
+ 
+ logger = Logger(module="chefboost/training/Training.py")
+ 
++_LEAF_ID_SEQ = itertools.count()
++_LEAF_ID_PREFIX = str(os.getpid())
++
++
++def _new_leaf_id() -> str:
++    return "%s-%d" % (_LEAF_ID_PREFIX, next(_LEAF_ID_SEQ))
++
+ global decision_rules  # pylint: disable=global-at-module-level
+ 
+ 
+@@ -47,12 +56,10 @@
+ 
+     instances = df.shape[0]
+ 
+-    decisions = df["Decision"].value_counts().keys().tolist()
++    decision_counts = df["Decision"].value_counts()
+ 
+     entropy = 0
+-    for i, decision in enumerate(decisions):
+-        num_of_decisions = df["Decision"].value_counts().tolist()[i]
+-        logger.debug(f"{decision} -> {num_of_decisions}")
++    for num_of_decisions in decision_counts.tolist():
+         class_probability = num_of_decisions / instances
+         entropy = entropy - class_probability * math.log(class_probability, 2)
+ 
+@@ -107,6 +114,106 @@
+     return winner_name, df.shape[0], metric_value, metric_name
+ 
+ 
++def _entropy_from_decisions(decision_series, instances: int, config: dict) -> float:
++    """Entropy computed from the Decision column only (same result as calculateEntropy)."""
++    if config["algorithm"] == "Regression":
++        return 0
++
++    entropy = 0
++    for num_of_decisions in decision_series.value_counts().tolist():
++        class_probability = num_of_decisions / instances
++        entropy = entropy - class_probability * math.log(class_probability, 2)
++
++    return entropy
++
++
++def _gain_for_column(col, dec_codes, n_class, entropy, instances, algorithm):
++    """Gain of one attribute from its contingency table (ID3/C4.5); None if not computable."""
++    f_codes, f_uniques = pd.factorize(col, sort=False)
++    n_val = len(f_uniques)
++    if n_val == 0 or (f_codes < 0).any():
++        return None
++
++    cont = np.bincount(f_codes * n_class + dec_codes,
++                       minlength=n_val * n_class).reshape(n_val, n_class)
++    totals = cont.sum(axis=1)
++
++    gain = entropy * 1
++    splitinfo = 0
++
++    for vi in np.argsort(-totals, kind="stable"):
++        subset_instances = int(totals[vi])
++        class_probability = subset_instances / instances
++
++        counts = cont[vi]
++        subset_entropy = 0
++        for ci in np.argsort(-counts, kind="stable"):
++            c = int(counts[ci])
++            if c == 0:
++                break
++            p = c / subset_instances
++            subset_entropy = subset_entropy - p * math.log(p, 2)
++
++        gain = gain - class_probability * subset_entropy
++
++        if algorithm == "C4.5":
++            splitinfo = splitinfo - class_probability * math.log(class_probability, 2)
++
++    if algorithm == "C4.5":
++        if splitinfo == 0:
++            splitinfo = 100
++        gain = gain / splitinfo
++
++    return gain
++
++
++def _fast_gains_id3_c45(df: pd.DataFrame, config: dict, entropy: float, instances: int):
++    """numpy path for the ID3/C4.5 gains of discretized (string-valued) attributes."""
++    algorithm = config["algorithm"]
++    dec_codes, dec_uniques = pd.factorize(df["Decision"], sort=False)
++    n_class = len(dec_uniques)
++
++    gains = []
++    for i in range(0, df.shape[1] - 1):
++        f_codes, f_uniques = pd.factorize(df.iloc[:, i], sort=False)
++        n_val = len(f_uniques)
++
++        cont = np.bincount(f_codes * n_class + dec_codes,
++                           minlength=n_val * n_class).reshape(n_val, n_class)
++        totals = cont.sum(axis=1)
++        value_order = np.argsort(-totals, kind="stable")
++
++        gain = entropy * 1
++        splitinfo = 0
++
++        for vi in value_order:
++            subset_instances = int(totals[vi])
++            class_probability = subset_instances / instances
++
++            counts = cont[vi]
++            subset_entropy = 0
++            for ci in np.argsort(-counts, kind="stable"):
++                c = int(counts[ci])
++                if c == 0:
++                    break
++                p = c / subset_instances
++                subset_entropy = subset_entropy - p * math.log(p, 2)
++
++            gain = gain - class_probability * subset_entropy
++
++            if algorithm == "C4.5":
++                splitinfo = splitinfo - class_probability * math.log(class_probability, 2)
++
++        if algorithm == "C4.5":
++            if splitinfo == 0:
++                splitinfo = 100
++            gain = gain / splitinfo
++
++        gains.append(gain)
++
++    return gains
++
++
+ def findGains(df: pd.DataFrame, config: dict) -> dict:
+     """
+     Find entropy and gains of each feature in the data frame
+@@ -129,17 +236,33 @@
+     columns = df.shape[1]
+     instances = df.shape[0]
+ 
++    fast_ok = False
++    dec_codes = None
++    n_class = 0
++    if algorithm in ["ID3", "C4.5"]:
++        dec_codes, dec_uniques = pd.factorize(df["Decision"], sort=False)
++        n_class = len(dec_uniques)
++        fast_ok = n_class > 0 and not (dec_codes < 0).any()
++
+     gains = []
+ 
+     for i in range(0, columns - 1):
+         column_name = df.columns[i]
+         column_type = df[column_name].dtypes
+ 
+-        logger.debug(f"{column_name} -> {column_type}")
++        if logger.is_debug():
++            logger.debug(f"{column_name} -> {column_type}")
+ 
+         if column_type != "object":
+             df = Preprocess.processContinuousFeatures(algorithm, df, column_name, entropy, config)
+ 
++        if fast_ok:
++            g = _gain_for_column(df[column_name], dec_codes, n_class,
++                                 entropy, instances, algorithm)
++            if g is not None:
++                gains.append(g)
++                continue
++
+         classes = df[column_name].value_counts()
+ 
+         splitinfo = 0
+@@ -148,25 +271,29 @@
+         else:
+             gain = 0
+ 
++        class_keys = classes.keys().tolist()
++        decision_col = df["Decision"]
++
+         for j in range(0, len(classes)):
+-            current_class = classes.keys().tolist()[j]
+-            logger.debug(f"{column_name} -> {current_class}")
++            current_class = class_keys[j]
++            if logger.is_debug():
++                logger.debug(f"{column_name} -> {current_class}")
+ 
+-            subdataset = df[df[column_name] == current_class]
+-            logger.debug(subdataset)
++            sub_decision = decision_col[df[column_name] == current_class]
++            logger.debug(sub_decision)
+ 
+-            subset_instances = subdataset.shape[0]
++            subset_instances = sub_decision.shape[0]
+             class_probability = subset_instances / instances
+ 
+             if algorithm in ["ID3", "C4.5"]:
+-                subset_entropy = calculateEntropy(subdataset, config)
++                subset_entropy = _entropy_from_decisions(sub_decision, subset_instances, config)
+                 gain = gain - class_probability * subset_entropy
+ 
+             if algorithm == "C4.5":
+                 splitinfo = splitinfo - class_probability * math.log(class_probability, 2)
+ 
+             elif algorithm == "CART":  # GINI index
+-                decision_list = subdataset["Decision"].value_counts().tolist()
++                decision_list = sub_decision.value_counts().tolist()
+ 
+                 subgini = 1
+ 
+@@ -181,7 +308,7 @@
+                 expected = subset_instances / num_of_decisions
+ 
+                 for d in decision_classes:
+-                    num_of_d = subdataset[subdataset["Decision"] == d].shape[0]
++                    num_of_d = int((sub_decision == d).sum())
+ 
+                     chi_square_of_d = math.sqrt(
+                         ((num_of_d - expected) * (num_of_d - expected)) / expected
+@@ -190,7 +317,7 @@
+                     gain += chi_square_of_d
+ 
+             elif algorithm == "Regression":
+-                subset_stdev = subdataset["Decision"].std(ddof=0)
++                subset_stdev = sub_decision.std(ddof=0)
+                 gain = gain + (subset_instances / instances) * subset_stdev
+ 
+         # iterating over classes for loop end
+@@ -218,7 +345,8 @@
+     resp_obj["gains"] = {}
+ 
+     for idx, feature in enumerate(df.columns[0:-1]):  # Decision is always the last column
+-        logger.debug(f"{idx}, {feature}")
++        if logger.is_debug():
++            logger.debug(f"{idx}, {feature}")
+         resp_obj["gains"][feature] = gains[idx]
+ 
+     resp_obj["entropy"] = entropy
+@@ -226,6 +354,20 @@
+     return resp_obj
+ 
+ 
++def _leaf_label(decisions: pd.Series, config: dict):
++    """Leaf label: majority class (as in chefboost) unless config['leaf_label'] == 'prior'."""
++    counts = decisions.value_counts()
++    prior = config.get("_leaf_prior") if config.get("leaf_label") == "prior" else None
++    if not prior:
++        return counts.idxmax()
++    best, best_r = None, -1.0
++    for cls, n in counts.items():
++        r = n / prior.get(cls, 1.0)
++        if r > best_r:
++            best, best_r = cls, r
++    return best
++
++
+ def createBranchWrapper(func, args):
+     return func(*args)
+ 
+@@ -246,6 +388,8 @@
+     metric: float,
+     tree_id: int = 0,
+     main_process_id: Optional[int] = None,
++    default_return = None,
++    feature_value_map = None
+ ) -> list:
+     """
+     Create a branch and its leafs in the tree
+@@ -297,6 +441,57 @@
+ 
+     terminateBuilding = False
+ 
++    if subdataset.shape[0] == 0:
++        if enableParallelism == True:
++            check_condition = "if"
++        else:
++            if branch_index == 0:
++                check_condition = "if"
++            else:
++                check_condition = "elif"
++
++        check_rule = check_condition + " obj[" + str(winner_index) + "]" + compareTo + ":"
++
++        leaf_id = _new_leaf_id()
++
++        if enableParallelism != True:
++            functions.storeRule(file, (functions.formatRule(root), "", check_rule))
++            functions.storeRule(
++                file,
++                (functions.formatRule(root + 1), "return " + repr(default_return))
++            )
++        else:
++            sample_rule = {}
++            sample_rule["current_level"] = root
++            sample_rule["leaf_id"] = leaf_id
++            sample_rule["parents"] = parents
++            sample_rule["rule"] = check_rule
++            sample_rule["feature_idx"] = winner_index
++            sample_rule["feature_name"] = winner_name
++            sample_rule["instances"] = 0
++            sample_rule["metric"] = metric
++            sample_rule["return_statement"] = 0
++            sample_rule["tree_id"] = tree_id
++            custom_rules.append(json.dumps(sample_rule))
++
++            parents = copy.copy(leaf_id)
++            leaf_id = _new_leaf_id()
++
++            sample_rule = {}
++            sample_rule["current_level"] = root + 1
++            sample_rule["leaf_id"] = leaf_id
++            sample_rule["parents"] = parents
++            sample_rule["rule"] = "return " + repr(default_return)
++            sample_rule["feature_idx"] = winner_index
++            sample_rule["feature_name"] = winner_name
++            sample_rule["instances"] = 0
++            sample_rule["metric"] = 0
++            sample_rule["return_statement"] = 1
++            sample_rule["tree_id"] = tree_id
++            custom_rules.append(json.dumps(sample_rule))
++
++        return custom_rules
++
+     # -----------------------------------------------
+     # can decision be made?
+ 
+@@ -314,7 +509,7 @@
+         )  # all items are equal in this case
+         terminateBuilding = True
+     elif subdataset.shape[1] == 1:  # if decision cannot be made even though all columns dropped
+-        final_decision = subdataset["Decision"].value_counts().idxmax()  # get the most frequent one
++        final_decision = _leaf_label(subdataset["Decision"], config)
+         terminateBuilding = True
+     elif algorithm == "Regression" and (
+         subdataset.shape[0] < 5 or root >= max_depth
+@@ -322,7 +517,7 @@
+         final_decision = subdataset["Decision"].mean()  # get average
+         terminateBuilding = True
+     elif algorithm in ["ID3", "C4.5", "CART", "CHAID"] and root >= max_depth:
+-        final_decision = subdataset["Decision"].value_counts().idxmax()  # get the most frequent one
++        final_decision = _leaf_label(subdataset["Decision"], config)
+         terminateBuilding = True
+ 
+     # -----------------------------------------------
+@@ -337,7 +532,7 @@
+ 
+     check_rule = check_condition + " obj[" + str(winner_index) + "]" + compareTo + ":"
+ 
+-    leaf_id = str(uuid.uuid1())
++    leaf_id = _new_leaf_id()
+ 
+     if enableParallelism != True:
+         functions.storeRule(file, (functions.formatRule(root), "", check_rule))
+@@ -363,7 +558,7 @@
+ 
+     if terminateBuilding == True:  # check decision is made
+         parents = copy.copy(leaf_id)
+-        leaf_id = str(uuid.uuid1())
++        leaf_id = _new_leaf_id()
+ 
+         decision_rule = "return " + charForResp + str(final_decision) + charForResp
+ 
+@@ -393,6 +588,10 @@
+         root = root + 1  # the following rule will be included by this rule. increase root
+         parents = copy.copy(leaf_id)
+ 
++        feature_value_map = config.get("feature_value_map", None)
++        default_return = config.get("default_return", None)
++        #
++
+         results = buildDecisionTree(
+             subdataset,
+             root,
+@@ -404,6 +603,8 @@
+             parents,
+             tree_id=tree_id,
+             main_process_id=main_process_id,
++            feature_value_map=feature_value_map,
++            default_return=default_return,
+         )
+ 
+         custom_rules = custom_rules + results
+@@ -411,7 +612,9 @@
+         root = tmp_root * 1
+         parents = copy.copy(parents_raw)
+ 
+-    gc.collect()
++    # DWARF modification: the forced gc.collect() per branch was removed (speed only;
++    # the tree is unchanged). Original line:
++    # gc.collect()
+ 
+     return custom_rules
+ 
+@@ -428,6 +631,9 @@
+     tree_id: int = 0,
+     validation_df: Optional[pd.DataFrame] = None,
+     main_process_id: Optional[int] = None,
++    name:str = None,
++    feature_value_map : dict = None,
++    default_return=None
+ ) -> list:
+     """
+     Build a decition tree rules
+@@ -461,7 +667,8 @@
+ 
+     # --------------------------------------
+ 
+-    df_copy = df.copy()
++    _needs_restore = not all(dt == object for dt in df.dtypes[: df.shape[1] - 1])
++    df_copy = df.copy() if _needs_restore else None
+ 
+     winner_name, num_of_instances, metric, _ = findDecision(df, config)
+ 
+@@ -479,24 +686,33 @@
+ 
+     # restoration
+     columns = df.shape[1]
+-    for i in range(0, columns - 1):
+-        column_name = df_copy.columns[i]
+-        column_type = df_copy[column_name].dtypes
+-        if column_type != "object" and column_name != winner_name:
+-            df[column_name] = df_copy[column_name]
++    if df_copy is not None:
++        for i in range(0, columns - 1):
++            column_name = df_copy.columns[i]
++            column_type = df_copy[column_name].dtypes
++            if column_type != "object" and column_name != winner_name:
++                df[column_name] = df_copy[column_name]
++
+ 
+-    classes = df[winner_name].value_counts().keys().tolist()
+-    logger.debug(f"classes: {classes} in {winner_name}")
++    if numericColumn:
++        classes = df[winner_name].value_counts().keys().tolist()
++    else:
++        classes = feature_value_map[winner_name]
++    # classes = df[winner_name].value_counts().keys().tolist()
++
++    if logger.is_debug():
++        logger.debug(f"classes: {classes} in {winner_name}")
+     # -----------------------------------------------------
+ 
+     num_cores = config["num_cores"]
+ 
+     input_params = []
+ 
++    _keep_cols = [c for c in df.columns if c != winner_name]
++
+     # serial approach
+     for i, current_class in enumerate(classes):
+-        subdataset = df[df[winner_name] == current_class]
+-        subdataset = subdataset.drop(columns=[winner_name])
++        subdataset = df.loc[df[winner_name] == current_class, _keep_cols]
+         branch_index = i * 1
+ 
+         # create branches serially
+@@ -529,6 +745,8 @@
+                 metric,
+                 tree_id=tree_id,
+                 main_process_id=main_process_id,
++                default_return=default_return,
++                feature_value_map=feature_value_map,
+             )
+ 
+             decision_rules = decision_rules + results
+@@ -551,20 +769,23 @@
+                     metric,
+                     tree_id,
+                     main_process_id,
++                    default_return,
++                    feature_value_map,
+                 )
+             )
+ 
+     # ---------------------------
+     # add else condition in the decision tree
+     if df.Decision.dtypes == "object":  # classification
+-        pivot = pd.DataFrame(df.Decision.value_counts()).sort_values(by=["count"], ascending=False)
+-        else_decision = f"return '{str(pivot.iloc[0].name)}'"
++        pivot = pd.DataFrame(df.Decision.value_counts()).sort_values(by=["Decision"], ascending=False) #TODO Update this part by Jun
++        # else_decision = f"return '{str(pivot.iloc[0].name)}'"
++        else_decision = "return " + repr(default_return)
+ 
+         if enableParallelism != True:
+             functions.storeRule(file, (functions.formatRule(root), "else:"))
+             functions.storeRule(file, (functions.formatRule(root + 1), else_decision))
+         else:  # parallelism
+-            leaf_id = str(uuid.uuid1())
++            leaf_id = _new_leaf_id()
+ 
+             check_rule = "else: " + else_decision
+ 
+@@ -591,7 +812,7 @@
+             functions.storeRule(file, (functions.formatRule(root), "else:"))
+             functions.storeRule(file, (functions.formatRule(root + 1), else_decision))
+         else:
+-            leaf_id = str(uuid.uuid1())
++            leaf_id = _new_leaf_id()
+ 
+             check_rule = "else: " + else_decision
+ 
+@@ -612,13 +833,17 @@
+ 
+     # ---------------------------
+ 
+-    try:
+-        main_process = psutil.Process(main_process_id)
+-        children = main_process.children(recursive=True)
+-        active_processes = len(children) + 1  # plus parent
+-        # active_processes = len(children)
+-    except:
+-        active_processes = 100  # set a large initial value
++    # DWARF modification: the process scan is only needed when parallelism is on.
++    if enableParallelism == True:
++        try:
++            main_process = psutil.Process(main_process_id)
++            children = main_process.children(recursive=True)
++            active_processes = len(children) + 1  # plus parent
++            # active_processes = len(children)
++        except:
++            active_processes = 100  # set a large initial value
++    else:
++        active_processes = 100  # unused on the serial path
+ 
+     results = []
+     # create branches in parallel
+@@ -707,7 +932,7 @@
+         ):
+             # this is reguler decision tree. find accuracy here.
+ 
+-            module_name = "outputs/rules/rules"
++            module_name = "outputs/rules/{0}".format(name)
+             myrules = load_module(module_name)  # rules0
+             models.append(myrules)
+ 

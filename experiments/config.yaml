@@ -1,0 +1,25 @@
+# Default DWARF parameters (as used in the paper).
+dwarf:
+  candidate_mode: cbs        # midpoint (DWARF-All) | cb (DWARF-CB) | cbs (DWARF-CBS)
+  fi_threshold: 0.7          # tau: cumulative RF importance kept by the pre-selection
+  top_features: 5            # f_min: minimum number of pre-selected attributes
+  max_disc: 3                # b_max: maximum number of intervals (branches) per attribute
+  cbs_lookahead: 4           # L: look-ahead window of the CBS stability filter
+  fitness_metric: accuracy   # accuracy | balanced_accuracy | macro_f1 | mcc | gmean
+
+ga:
+  population_size: 100
+  generations: 20
+  survival_rate: 0.1         # elite share kept unchanged each generation (10 of 100)
+  mutation_rate: 0.3         # offspring by mutation (redraws 1/5 of the genes, at least 1)
+  crossover_rate: 0.4        # offspring by crossover (copies 30% of the genes, rounded up, from a second parent)
+  random_rate: 0.2           # fresh random chromosomes
+  fitness_cache: true        # identical genotypes are not refitted
+
+tree:
+  algorithm: C4.5
+  max_depth: 3
+
+experiment:
+  n_folds: 5
+  seeds_file: seeds.txt
